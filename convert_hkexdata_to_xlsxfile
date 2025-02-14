@@ -1,0 +1,172 @@
+import os
+import pandas as pd
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from openpyxl import load_workbook
+from openpyxl.styles import Font, Alignment, PatternFill
+import traceback
+
+def clean_and_extract_data(file_path):
+    try:
+        # 讀取 Excel 文件
+        df = pd.read_excel(file_path, sheet_name=0)
+        
+        # 篩選 B 欄包含 "TMC_" 的資料行
+        filtered_data = df[df.iloc[:, 1].astype(str).str.contains(r'^TMC_', na=False)].reset_index(drop=True)
+        
+        # 確保只保留指定的 11 個欄位
+        filtered_data = filtered_data.iloc[:, :11]
+
+        # 設定欄位名稱
+        filtered_data.columns = [
+            '索引排名', '自選組合名稱', '合約1', '合約2', '合約3', '合約4', 
+            '開市', '全日最高', '全日最低', '最後成交', '成交量'
+        ]
+        
+        # 過濾掉包含 "自選組合名稱" 標題行
+        filtered_data = filtered_data[filtered_data['自選組合名稱'] != '自選組合名稱'].reset_index(drop=True)
+        return filtered_data
+
+    except Exception as e:
+        print(f"Error processing file {file_path}: {e}")
+        traceback.print_exc()
+        return None
+
+def process_text(text):
+    pattern = re.compile(r'\((買|賣) (\d+)\) HSI(\d+)([A-X])(\d)')
+    match = pattern.match(text)
+    if not match:
+        return [None, None, None, None]
+    action = 'LONG' if match.group(1) == '買' else 'SHORT'
+    number = int(match.group(3))
+    month_code = match.group(4)
+    option_type = 'CALL' if 'A' <= month_code <= 'L' else 'PUT'
+    month = ord(month_code) - ord('A') + 1 if option_type == 'CALL' else ord(month_code) - ord('M') + 1
+    year_mapping = {'4': '2024', '5': '2025'}
+    year = year_mapping.get(match.group(5), 'Unknown')
+    return [action, number, f'{month}月{option_type}', year]
+
+def format_worksheet(ws):
+    font = Font(name='Microsoft JhengHei', size=11)
+    alignment = Alignment(horizontal='center', vertical='center')
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            cell.font = font
+            cell.alignment = alignment
+            if cell.value:
+                max_length = max(max_length, len(str(cell.value)))
+        adjusted_width = (max_length + 2) * 1.2
+        ws.column_dimensions[column].width = adjusted_width
+
+def format_excel(file_path):
+    try:
+        wb = load_workbook(file_path)
+        ws = wb.active
+        format_worksheet(ws)
+        
+        yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        for row in ws.iter_rows(min_row=2, min_col=1, max_col=ws.max_column):
+            if row[10].value and row[10].value >= 50:
+                for cell in row:
+                    cell.fill = yellow_fill
+        wb.save(file_path)
+    except Exception as e:
+        print(f"Error formatting file {file_path}: {e}")
+        traceback.print_exc()
+
+def process_file(file_path, base_path):
+    try:
+        file_date = os.path.splitext(os.path.basename(file_path))[0]
+        df_cleaned = clean_and_extract_data(file_path)
+        if df_cleaned is not None:
+            for col in ['合約1', '合約2', '合約3', '合約4']:
+                df_cleaned[[f'{col}_LoS', f'{col}_Strike', f'{col}_OptType', f'{col}_Yr']] = df_cleaned[col].apply(
+                    lambda x: process_text(x) if isinstance(x, str) else [None, None, None, None]
+                ).tolist()
+            df_cleaned['日期'] = file_date
+            df_cleaned = df_cleaned[df_cleaned['成交量'] >= 20].reset_index(drop=True)
+            processed_file_path = os.path.join(base_path, f'processed_{file_date}.xlsx')
+            df_cleaned.to_excel(processed_file_path, index=False)
+            format_excel(processed_file_path)
+    except Exception as e:
+        #print(f"Error processing file {file_path}: {e}")
+        traceback.print_exc()
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+def merge_processed_files(directory):
+    result_file_path = os.path.join(directory, 'result_TMC.xlsx')
+    
+    # 讀取已有的 result_TMC.xlsx 文件，如果存在，並將其視為基礎資料
+    if os.path.exists(result_file_path):
+        df_existing = pd.read_excel(result_file_path)
+    else:
+        df_existing = pd.DataFrame()  # 若檔案不存在，建立空的 DataFrame
+
+    # 找到所有新的 processed_ 文件
+    files = [f for f in os.listdir(directory) if f.startswith('processed_') and f.endswith('.xlsx')]
+    df_list = []
+    for file in files:
+        df = pd.read_excel(os.path.join(directory, file))
+        
+        # 去除 Yr 欄位，保持資料簡潔
+        df.drop(columns=['合約1_Yr', '合約2_Yr', '合約3_Yr', '合約4_Yr'], errors='ignore', inplace=True)
+        
+        # 刪除不需要的列
+        df.drop(columns=['開市', '全日最高', '全日最低'], errors='ignore', inplace=True)
+        
+        df_list.append(df)
+
+    # 合併現有的 result_TMC.xlsx 資料與新處理的資料，並保留所有資料
+    if df_list:
+        combined_df = pd.concat([df_existing] + df_list, ignore_index=True)
+
+        # 設定合併後的欄位順序，確保一致性
+        columns_order = [
+            '索引排名', '自選組合名稱', '合約1', '合約2', '合約3', '合約4',
+            '最後成交', '成交量',
+            '日期', '合約1_LoS', '合約1_OptType', '合約1_Strike',
+            '合約2_LoS', '合約2_OptType', '合約2_Strike',
+            '合約3_LoS', '合約3_OptType', '合約3_Strike',
+            '合約4_LoS', '合約4_OptType', '合約4_Strike'
+        ]
+        
+        # 確保合併後的 DataFrame 包含所有欄位
+        for col in columns_order:
+            if col not in combined_df.columns:
+                combined_df[col] = None
+        combined_df = combined_df[columns_order]
+
+        # 寫回至 result_TMC.xlsx
+        combined_df.to_excel(result_file_path, index=False, engine='openpyxl')
+        
+        # 格式化 Excel 文件
+        wb = load_workbook(result_file_path)
+        ws = wb.active
+        format_worksheet(ws)
+        wb.save(result_file_path)
+
+    # 刪除處理過的臨時文件
+    for file in files:
+        os.remove(os.path.join(directory, file))
+
+
+def process_files_concurrently(file_paths, base_path):
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(process_file, fp, base_path): fp for fp in file_paths}
+        for future in as_completed(futures):
+            try:
+                future.result()  # 捕获并报告异常
+            except Exception as e:
+                print(f"Error processing file {futures[future]}: {e}")
+                traceback.print_exc()
+
+if __name__ == "__main__":
+    base_path = r'C:\pythonData\result_hs_tmc\HSI'
+    file_paths = [os.path.join(base_path, f) for f in os.listdir(base_path) if f.endswith('.xlsx') and not f.startswith('result_TMC')]
+    process_files_concurrently(file_paths, base_path)
+    merge_processed_files(base_path)
+    print(f"合并后的文件已保存至: {os.path.join(base_path, 'result_TMC.xlsx')}")
